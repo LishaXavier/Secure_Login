@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Secure Login (SHA-256 + AES)</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+ --bg:#f1f5f9;--card:#fff;--tx:#0f172a;--mut:#64748b;--bd:#cbd5e1;--ac:#2563eb}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f172a;--card:#1e293b;--tx:#e2e8f0;--mut:#94a3b8;--bd:#475569;--ac:#3b82f6}}
+html,body{margin:0;min-height:100%}
+body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--tx);display:flex;justify-content:center;padding:24px 14px}
+.card{background:var(--card);padding:24px;border-radius:14px;width:100%;max-width:380px;height:fit-content;box-shadow:0 8px 24px #0002}
+h2{margin:0 0 14px}label{font-size:13px;color:var(--mut)}
+input{width:100%;padding:10px;margin:4px 0 12px;border-radius:8px;border:1px solid var(--bd);background:transparent;color:var(--tx);font-size:16px;box-sizing:border-box}
+button{width:100%;padding:11px;border:0;border-radius:8px;background:var(--ac);color:#fff;font-size:15px;cursor:pointer}
+.msg{padding:8px 10px;border-radius:8px;margin-bottom:12px;background:#64748b33;font-size:14px}
+a{color:var(--ac);cursor:pointer}code{display:block;word-break:break-all;font-size:12px;color:var(--mut);margin:6px 0 12px}
+small{color:var(--mut)}
+</style></head><body><div class="card" id="app"></div>
+<script>
+const enc=new TextEncoder(),dec=new TextDecoder(),ITER=200000,TTL=15*60e3;
+let mem={};                                   // fallback if storage is blocked
+const getUsers=()=>{try{return JSON.parse(localStorage.getItem('users')||'{}')}catch(e){return mem}};
+const saveUsers=u=>{mem=u;try{localStorage.setItem('users',JSON.stringify(u))}catch(e){}};
+const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const rnd=n=>crypto.getRandomValues(new Uint8Array(n));
+
+// SHA-256 (PBKDF2-HMAC-SHA256, salted, 200k rounds)
+async function pbkdf2(pw,salt){
+  const k=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveBits']);
+  return crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:ITER,hash:'SHA-256'},k,256);
+}
+const aesKey=(raw,use)=>crypto.subtle.importKey('raw',raw,'AES-GCM',false,use);
+async function aesEnc(key,text){const iv=rnd(12);const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,enc.encode(text));
+  const o=new Uint8Array(12+ct.byteLength);o.set(iv);o.set(new Uint8Array(ct),12);return b64(o)}
+async function aesDec(key,tok){const r=unb64(tok);return dec.decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:r.slice(0,12)},key,r.slice(12)))}
+const same=(a,b)=>{if(a.length!==b.length)return false;let d=0;for(let i=0;i<a.length;i++)d|=a.charCodeAt(i)^b.charCodeAt(i);return d===0};
+const strong=p=>p.length>=8&&/[a-z]/.test(p)&&/[A-Z]/.test(p)&&/\d/.test(p)&&/[^\w\s]/.test(p);
+
+let session=null;                             // {user, token, profile, exp} (memory only)
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function view(page,msg){
+  const m=msg?`<div class="msg">${esc(msg)}</div>`:'';
+  const A=$('#app');
+  if(page==='login')A.innerHTML=`${m}<h2>Login</h2>
+   <label>Username</label><input id="u" autocomplete="username">
+   <label>Password</label><input id="p" type="password" autocomplete="current-password">
+   <button id="go">Login</button><p><small>No account? <a id="sw">Register</a></small></p>`,
+   $('#go').onclick=login,$('#sw').onclick=()=>view('register');
+  else if(page==='register')A.innerHTML=`${m}<h2>Register</h2>
+   <label>Username (3-32: letters, digits, _)</label><input id="u">
+   <label>Password (8+, upper, lower, digit, symbol)</label><input id="p" type="password">
+   <label>Email (AES-encrypted)</label><input id="e" type="email">
+   <label>Phone (AES-encrypted)</label><input id="ph">
+   <button id="go">Create account</button><p><small>Have an account? <a id="sw">Login</a></small></p>`,
+   $('#go').onclick=register,$('#sw').onclick=()=>view('login');
+  else A.innerHTML=`${m}<h2>Welcome, ${esc(session.user)}</h2>
+   <p>Profile (decrypted with AES-256-GCM):<br>Email: ${esc(session.profile.email||'-')}<br>Phone: ${esc(session.profile.phone||'-')}</p>
+   <p>Encrypted session token:</p><code>${esc(session.token.slice(0,70))}...</code>
+   <small>Session expires in 15 minutes.</small><br><br><button id="out">Logout</button>`,
+   $('#out').onclick=()=>{session=null;view('login','Logged out.')};
+}
+
+async function register(){
+  const u=$('#u').value.trim(),p=$('#p').value,users=getUsers();
+  if(!/^[A-Za-z0-9_]{3,32}$/.test(u))return view('register','Invalid username.');
+  if(!strong(p))return view('register','Weak password (8+, upper, lower, digit, symbol).');
+  if(users[u])return view('register','Username already exists.');
+  const s1=rnd(16),s2=rnd(16);
+  const key=await aesKey(await pbkdf2(p,s2),['encrypt']);
+  users[u]={s1:b64(s1),s2:b64(s2),hash:b64(await pbkdf2(p,s1)),
+    profile:await aesEnc(key,JSON.stringify({email:$('#e').value,phone:$('#ph').value})),fails:0,lock:0};
+  saveUsers(users);view('login','Registered! Please login.');
+}
+
+async function login(){
+  const u=$('#u').value.trim(),p=$('#p').value,users=getUsers(),r=users[u];
+  if(!r){await pbkdf2(p,rnd(16));return view('login','Invalid credentials.')}
+  if(Date.now()<r.lock)return view('login','Too many attempts. Try again in a minute.');
+  const h=b64(await pbkdf2(p,unb64(r.s1)));
+  if(!same(h,r.hash)){
+    r.fails++;if(r.fails>=5){r.lock=Date.now()+60e3;r.fails=0}
+    saveUsers(users);return view('login','Invalid credentials.');
+  }
+  r.fails=0;r.lock=0;saveUsers(users);
+  const dkey=await aesKey(await pbkdf2(p,unb64(r.s2)),['decrypt']);
+  const profile=JSON.parse(await aesDec(dkey,r.profile));
+  const skey=await aesKey(rnd(32),['encrypt']);            // random per-session AES key
+  const exp=Date.now()+TTL;
+  const token=await aesEnc(skey,JSON.stringify({user:u,exp,jti:b64(rnd(8))}));
+  session={user:u,token,profile,exp};view('home');
+  setTimeout(()=>{if(session&&session.token===token){session=null;view('login','Session expired.')}},TTL);
+}
+view('login');
+</script></body></html>
